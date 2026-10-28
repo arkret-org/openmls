@@ -12,7 +12,11 @@ use openmls_traits::{
     types::{CryptoError, SignatureScheme},
 };
 
-use p256::ecdsa::{signature::Signer as P256Signer, Signature, SigningKey};
+use ed25519_dalek::Signer as _;
+use p256::{
+    ecdsa::{signature::Signer as P256Signer, Signature, SigningKey},
+    elliptic_curve::Generate,
+};
 
 use rand_core::OsRng;
 use serde::{Deserialize, Serialize};
@@ -68,13 +72,13 @@ impl Signer for SignatureKeyPair {
     fn sign(&self, payload: &[u8]) -> Result<Vec<u8>, SignerError> {
         match self.signature_scheme {
             SignatureScheme::ECDSA_SECP256R1_SHA256 => {
-                let k = SigningKey::from_bytes(self.private.as_slice().into())
+                let k = SigningKey::from_slice(self.private.as_slice())
                     .map_err(|_| SignerError::SigningError)?;
                 let signature: Signature = k.sign(payload);
                 Ok(signature.to_der().to_bytes().into())
             }
             SignatureScheme::ECDSA_SECP384R1_SHA384 => {
-                let k = p384::ecdsa::SigningKey::from_bytes(self.private.as_slice().into())
+                let k = p384::ecdsa::SigningKey::from_slice(self.private.as_slice())
                     .map_err(|_| SignerError::SigningError)?;
                 let signature: p384::ecdsa::Signature = k.sign(payload);
                 Ok(signature.to_der().to_bytes().into())
@@ -145,8 +149,9 @@ impl SignatureKeyPair {
     pub fn new(signature_scheme: SignatureScheme) -> Result<Self, CryptoError> {
         let (private, public) = match signature_scheme {
             SignatureScheme::ECDSA_SECP256R1_SHA256 => {
-                let k = SigningKey::random(&mut OsRng);
-                let pk = k.verifying_key().to_encoded_point(false).as_bytes().into();
+                let k = SigningKey::try_generate_from_rng(&mut getrandom::SysRng)
+                    .map_err(|_| CryptoError::InsufficientRandomness)?;
+                let pk = k.verifying_key().to_sec1_point(false).as_bytes().into();
                 #[allow(deprecated)]
                 let mut key_bytes = k.to_bytes();
                 let private: SecretVLBytes = key_bytes.as_slice().into();
@@ -154,8 +159,9 @@ impl SignatureKeyPair {
                 (private, pk)
             }
             SignatureScheme::ECDSA_SECP384R1_SHA384 => {
-                let k = p384::ecdsa::SigningKey::random(&mut OsRng);
-                let pk = k.verifying_key().to_encoded_point(false).as_bytes().into();
+                let k = p384::ecdsa::SigningKey::try_generate_from_rng(&mut getrandom::SysRng)
+                    .map_err(|_| CryptoError::InsufficientRandomness)?;
+                let pk = k.verifying_key().to_sec1_point(false).as_bytes().into();
                 (k.to_bytes().as_slice().into(), pk)
             }
             SignatureScheme::ED25519 => {
@@ -292,6 +298,30 @@ impl storage::traits::SignatureKeyPair<CURRENT_VERSION> for SignatureKeyPair {}
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn curve_credentials_verify_and_reject_tampering() {
+        use super::*;
+        use p256::ecdsa::signature::Verifier;
+        for scheme in [
+            SignatureScheme::ECDSA_SECP256R1_SHA256,
+            SignatureScheme::ECDSA_SECP384R1_SHA384,
+        ] {
+            let pair = SignatureKeyPair::new(scheme).unwrap();
+            let signature = pair.sign(b"credential").unwrap();
+            if scheme == SignatureScheme::ECDSA_SECP256R1_SHA256 {
+                let key = p256::ecdsa::VerifyingKey::from_sec1_bytes(pair.public()).unwrap();
+                let signature = p256::ecdsa::Signature::from_der(&signature).unwrap();
+                key.verify(b"credential", &signature).unwrap();
+                assert!(key.verify(b"changed", &signature).is_err());
+            } else {
+                let key = p384::ecdsa::VerifyingKey::from_sec1_bytes(pair.public()).unwrap();
+                let signature = p384::ecdsa::Signature::from_der(&signature).unwrap();
+                key.verify(b"credential", &signature).unwrap();
+                assert!(key.verify(b"changed", &signature).is_err());
+            }
+        }
+    }
+
     use super::*;
     use tls_codec::{DeserializeBytes as TlsDeserializeBytesTrait, Serialize as TlsSerializeTrait};
 
